@@ -1,5 +1,6 @@
 import pygame
 import random
+from collections import deque
 import utils.config as config
 import numpy as np
 from .block import Block
@@ -114,16 +115,46 @@ class Game:
         self.ready = True
 
     def _generate_room(self, cell_size: int) -> pygame.sprite.Group:
-        blocks_group = pygame.sprite.Group()
+        while True:
+            obstacle_map = np.zeros((self.grid_height, self.grid_width), dtype=bool)
 
-        for row in range(self.grid_height):
-            for col in range(self.grid_width):
-                if random.random() < config.OBSTACLE_PROBABILITY:
-                    x = col * cell_size
-                    y = row * cell_size
-                    block = Block(x, y)
-                    blocks_group.add(block)
-        return blocks_group
+            for row in range(self.grid_height):
+                for col in range(self.grid_width):
+                    if random.random() < config.OBSTACLE_PROBABILITY:
+                        obstacle_map[row, col] = True
+
+            if self._is_fully_connected(obstacle_map):
+                blocks_group = pygame.sprite.Group()
+                for row in range(self.grid_height):
+                    for col in range(self.grid_width):
+                        if obstacle_map[row, col]:
+                            blocks_group.add(Block(col * cell_size, row * cell_size))
+                return blocks_group
+
+    def _is_fully_connected(self, obstacle_map: np.ndarray) -> bool:
+        """BFS flood-fill: returns True only if every free cell is reachable from every other free cell."""
+        free_cells = [
+            (r, c)
+            for r in range(self.grid_height)
+            for c in range(self.grid_width)
+            if not obstacle_map[r, c]
+        ]
+        if not free_cells:
+            return False
+
+        visited = set()
+        queue = deque([free_cells[0]])
+        visited.add(free_cells[0])
+
+        while queue:
+            r, c = queue.popleft()
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if (nr, nc) not in visited and 0 <= nr < self.grid_height and 0 <= nc < self.grid_width and not obstacle_map[nr, nc]:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+
+        return len(visited) == len(free_cells)
 
     def _initialize_robots(self, num_robots: int, cell_size: int) -> List[Robot]:
         temp_robots_list: List[Robot] = []

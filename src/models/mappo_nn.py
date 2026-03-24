@@ -1,25 +1,38 @@
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import utils.config as config
+import torch.optim as optim
 from torch.distributions import Categorical
+
+import utils.config as config
 from memory import OnPolicyRolloutStorage
+
+
+def _init_layer(layer, gain=np.sqrt(2)):
+    """Orthogonal initialization for stable training."""
+    nn.init.orthogonal_(layer.weight, gain=gain)
+    nn.init.constant_(layer.bias, 0)
+    return layer
 
 
 class Actor(nn.Module):
     def __init__(self, input_size, num_actions):
         super().__init__()
-        self.fc1 = nn.Linear(input_size, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3_logits = nn.Linear(128, num_actions)
+        self.net = nn.Sequential(
+            _init_layer(nn.Linear(input_size, 256)),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            _init_layer(nn.Linear(256, 128)),
+            nn.LayerNorm(128),
+            nn.Tanh(),
+            _init_layer(nn.Linear(128, num_actions), gain=0.01),
+        )
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        logits = self.fc3_logits(x)
-        return logits
+        return self.net(state)
 
     def get_action_dist(self, state):
         logits = self.forward(state)
@@ -29,15 +42,18 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, input_size_all):
         super().__init__()
-        self.fc1 = nn.Linear(input_size_all, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3_value = nn.Linear(128, config.ROBOT_NUMBER)
+        self.net = nn.Sequential(
+            _init_layer(nn.Linear(input_size_all, 256)),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            _init_layer(nn.Linear(256, 128)),
+            nn.LayerNorm(128),
+            nn.Tanh(),
+            _init_layer(nn.Linear(128, config.ROBOT_NUMBER), gain=1.0),
+        )
 
     def forward(self, all_obs_concatenated):
-        x = F.relu(self.fc1(all_obs_concatenated))
-        x = F.relu(self.fc2(x))
-        values = self.fc3_value(x)
-        return values
+        return self.net(all_obs_concatenated)
 
 
 class MAPPOAgent:
@@ -45,21 +61,42 @@ class MAPPOAgent:
         self.n_agents = config.ROBOT_NUMBER
         self.dim_obs_robot = dim_obs_robot
         self.num_actions = num_actions
+        self.entropy_coeff = config.ENTROPY_COEFF
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Agent using device: {self.device}")
 
         dim_obs_all = self.n_agents * dim_obs_robot
 
-        self.actors = [Actor(dim_obs_robot, num_actions).to(self.device) for _ in range(self.n_agents)]
+        self.actors = [
+            Actor(dim_obs_robot, num_actions).to(self.device)
+            for _ in range(self.n_agents)
+        ]
         self.critic = Critic(dim_obs_all).to(self.device)
 
-        self.actor_optimizers = [optim.Adam(actor.parameters(), lr=config.LR_ACTOR) for actor in self.actors]
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.LR_CRITIC)
+        self.actor_optimizers = [
+            optim.Adam(actor.parameters(), lr=config.LR_ACTOR, eps=1e-5)
+            for actor in self.actors
+        ]
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=config.LR_CRITIC, eps=1e-5
+        )
 
-        self.storage = OnPolicyRolloutStorage(self.n_agents, config.ROLLOUT_LENGTH, dim_obs_robot, num_actions, self.device)
+        self.storage = OnPolicyRolloutStorage(
+            self.n_agents,
+            config.ROLLOUT_LENGTH,
+            dim_obs_robot,
+            num_actions,
+            self.device,
+        )
 
         self._load_model()
+
+    def decay_entropy(self):
+        self.entropy_coeff = max(
+            config.ENTROPY_COEFF_MIN,
+            self.entropy_coeff * config.ENTROPY_COEFF_DECAY,
+        )
 
     def select_actions(self, all_obs_list_numpy, evaluate=False):
         actions_list_tensor = []
@@ -79,14 +116,12 @@ class MAPPOAgent:
         for i in range(self.n_agents):
             obs_tensor = all_obs_tensors[i]
 
-            self.actors[i].eval()
             with torch.no_grad():
                 action_dist = self.actors[i].get_action_dist(obs_tensor)
                 if evaluate:
                     action = action_dist.probs.argmax(dim=-1, keepdim=True)
                 else:
                     action = action_dist.sample().unsqueeze(-1)
-            self.actors[i].train()
 
             log_prob = action_dist.log_prob(action.squeeze(-1)).unsqueeze(-1)
 
@@ -96,7 +131,13 @@ class MAPPOAgent:
 
         actions_list_numpy = [a.item() for a in actions_list_tensor]
 
-        return actions_list_numpy, actions_list_tensor, log_probs_list_tensor, values_for_storage, global_obs_tensor
+        return (
+            actions_list_numpy,
+            actions_list_tensor,
+            log_probs_list_tensor,
+            values_for_storage,
+            global_obs_tensor,
+        )
 
     def store_transition(
         self,
@@ -135,9 +176,10 @@ class MAPPOAgent:
         with torch.no_grad():
             next_values_all_agents = self.critic(next_global_obs_tensor)
 
-        final_values_list = [next_values_all_agents[:, i].unsqueeze(-1) for i in range(self.n_agents)]
+        final_values_list = [
+            next_values_all_agents[:, i].unsqueeze(-1) for i in range(self.n_agents)
+        ]
         self.storage.store_final_values(final_values_list)
-
         self.storage.compute_advantages_and_returns(config.GAMMA, config.GAE_LAMBDA)
 
     def learn(self):
@@ -145,7 +187,7 @@ class MAPPOAgent:
         total_critic_loss_accum = 0.0
         total_entropy_accum = 0.0
 
-        for epoch in range(config.PPO_EPOCHS):
+        for _ in range(config.PPO_EPOCHS):
             data_generator = self.storage.get_generator(config.PPO_MINIBATCH_SIZE)
 
             for (
@@ -156,19 +198,11 @@ class MAPPOAgent:
                 batch_returns,
                 batch_advantages,
             ) in data_generator:
-                # --- Critic ---
                 predicted_values_all_agents = self.critic(batch_global_obs)
                 critic_loss_terms = []
                 for i in range(self.n_agents):
-                    predicted_values_agent_i = predicted_values_all_agents[:, i].unsqueeze(-1)
-                    current_agent_batch_returns = batch_returns[i]
-
-                    returns_mean = current_agent_batch_returns.mean()
-                    returns_std = current_agent_batch_returns.std()
-
-                    normalized_target_returns = (current_agent_batch_returns - returns_mean) / (returns_std + 1e-8)
-
-                    loss_v = F.mse_loss(predicted_values_agent_i, normalized_target_returns)
+                    predicted_v = predicted_values_all_agents[:, i].unsqueeze(-1)
+                    loss_v = F.mse_loss(predicted_v, batch_returns[i])
                     critic_loss_terms.append(loss_v)
 
                 critic_loss = torch.stack(critic_loss_terms).mean()
@@ -180,40 +214,46 @@ class MAPPOAgent:
                 total_critic_loss_accum += critic_loss.item()
 
                 # --- Actor ---
-                current_actor_loss_sum_for_batch = 0.0
-                current_entropy_sum_for_batch = 0.0
+                current_actor_loss_sum = 0.0
+                current_entropy_sum = 0.0
 
                 for i in range(self.n_agents):
                     action_dist = self.actors[i].get_action_dist(batch_all_obs[i])
-                    new_log_probs = action_dist.log_prob(batch_actions[i].squeeze(-1)).unsqueeze(-1)
+                    new_log_probs = action_dist.log_prob(
+                        batch_actions[i].squeeze(-1)
+                    ).unsqueeze(-1)
                     entropy = action_dist.entropy().mean()
 
                     ratio = torch.exp(new_log_probs - batch_old_log_probs[i])
-                    advantages_agent_i = batch_advantages[i]
+                    adv = batch_advantages[i]
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-                    advantages_agent_i = (advantages_agent_i - advantages_agent_i.mean()) / (advantages_agent_i.std() + 1e-8)
-
-                    surr1 = ratio * advantages_agent_i
-                    surr2 = torch.clamp(ratio, 1.0 - config.PPO_CLIP_EPS, 1.0 + config.PPO_CLIP_EPS) * advantages_agent_i
+                    surr1 = ratio * adv
+                    surr2 = (
+                        torch.clamp(
+                            ratio, 1.0 - config.PPO_CLIP_EPS, 1.0 + config.PPO_CLIP_EPS
+                        )
+                        * adv
+                    )
                     actor_loss = -torch.min(surr1, surr2).mean()
-
-                    actor_agent_loss = actor_loss - config.ENTROPY_COEFF * entropy
+                    loss = actor_loss - self.entropy_coeff * entropy
 
                     self.actor_optimizers[i].zero_grad()
-                    actor_agent_loss.backward()
-                    nn.utils.clip_grad_norm_(self.actors[i].parameters(), config.MAX_GRAD_NORM)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.actors[i].parameters(), config.MAX_GRAD_NORM
+                    )
                     self.actor_optimizers[i].step()
 
-                    current_actor_loss_sum_for_batch += actor_loss.item()
-                    current_entropy_sum_for_batch += entropy.item()
+                    current_actor_loss_sum += actor_loss.item()
+                    current_entropy_sum += entropy.item()
 
-                total_actor_loss_accum += current_actor_loss_sum_for_batch / self.n_agents
-                total_entropy_accum += current_entropy_sum_for_batch / self.n_agents
+                total_actor_loss_accum += current_actor_loss_sum / self.n_agents
+                total_entropy_accum += current_entropy_sum / self.n_agents
 
-        num_updates = config.PPO_EPOCHS * (self.storage.rollout_length // config.PPO_MINIBATCH_SIZE)
-        if num_updates == 0:
-            num_updates = 1
-
+        num_updates = config.PPO_EPOCHS * max(
+            1, self.storage.rollout_length // config.PPO_MINIBATCH_SIZE
+        )
         avg_actor_loss = total_actor_loss_accum / num_updates
         avg_critic_loss = total_critic_loss_accum / num_updates
         avg_entropy = total_entropy_accum / num_updates
@@ -224,33 +264,37 @@ class MAPPOAgent:
 
     def save_model(self):
         actor_state_dicts = [actor.state_dict() for actor in self.actors]
-        actor_optimizers_dicts = [actor_optimizer.state_dict() for actor_optimizer in self.actor_optimizers]
-        self.storage.after_update()
+        actor_optimizers_dicts = [opt.state_dict() for opt in self.actor_optimizers]
 
         checkpoint = {
             "actors_state_dict": actor_state_dicts,
             "critic_state_dict": self.critic.state_dict(),
             "actors_optimizer_state_dict": actor_optimizers_dicts,
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
-            "storage": self.storage,
+            "entropy_coeff": self.entropy_coeff,
         }
 
         torch.save(checkpoint, config.SAVE_PATH)
-        print(f"Model saved in: {config.SAVE_PATH}")
+        print(f"Model saved: {config.SAVE_PATH}")
 
     def _load_model(self):
         if not os.path.exists(config.SAVE_PATH):
             return
 
-        checkpoint = torch.load(config.SAVE_PATH, map_location=self.device)
+        checkpoint = torch.load(
+            config.SAVE_PATH, map_location=self.device, weights_only=False
+        )
 
         for i in range(self.n_agents):
             self.actors[i].load_state_dict(checkpoint["actors_state_dict"][i])
-            self.actor_optimizers[i].load_state_dict(checkpoint["actors_optimizer_state_dict"][i])
+            self.actor_optimizers[i].load_state_dict(
+                checkpoint["actors_optimizer_state_dict"][i]
+            )
 
         self.critic.load_state_dict(checkpoint["critic_state_dict"])
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
-        self.storage = checkpoint["storage"]
 
-        print(f"Model loaded with: {config.SAVE_PATH}")
-        return
+        if "entropy_coeff" in checkpoint:
+            self.entropy_coeff = checkpoint["entropy_coeff"]
+
+        print(f"Model loaded: {config.SAVE_PATH}")

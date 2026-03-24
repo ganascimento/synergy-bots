@@ -1,3 +1,7 @@
 **/__pycache__
 **/audio_data
 **/training_data
+
+.venv
+
+*.egg-info

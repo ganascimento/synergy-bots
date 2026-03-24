@@ -10,7 +10,6 @@ GRID_HEIGHT = HEIGHT // CELL_SIZE
 # --- Game Config ---
 
 SHOW_GAME_RENDER = False
-MODEL = 1  # 1 -> MAAC | 2 -> MAPPO
 
 # --- Environment Config ---
 
@@ -23,35 +22,39 @@ FPS = 30
 # --- Save Config ---
 
 SAVE_FOLDER = "./training_data"
-SAVE_PATH = f"{SAVE_FOLDER}/model_maac.pth" if MODEL == 1 else f"{SAVE_FOLDER}/model_mappo.pth"
-SAVE_MODEL_EVERY = 50
+SAVE_PATH = f"{SAVE_FOLDER}/model_mappo.pth"
+SAVE_MODEL_EVERY = 100
+
+# --- Log Config ---
+
+LOG_DIR = f"{SAVE_FOLDER}/logs"
+METRICS_CSV = f"{LOG_DIR}/training_metrics.csv"
+STATE_SNAPSHOT_FILE = f"{LOG_DIR}/current_state.json"
 
 # --- Global Train Config ---
-MAX_EPISODES = 1000
-MAX_STEPS = 200
-LR_ACTOR = 0.0001
-LR_CRITIC = 0.0005
+
+MAX_EPISODES = 5000
+# Maximum steps per episode. 8x6 grid = 48 cells; 2 robots need ~24 moves each
+# plus navigation overhead. 500 gives room to learn without running forever.
+MAX_STEPS = 500
+LR_ACTOR = 0.0003
+LR_CRITIC = 0.001
 GAMMA = 0.99
 
-# --- Train Config MAAC ---
+# --- Train Config MAPPO ---
 
 NN_INPUT_SIZE = (WIDTH // CELL_SIZE) * (HEIGHT // CELL_SIZE) + ROBOT_NUMBER * 2
-BUFFER_SIZE = 50000
-BATCH_SIZE = 256
-UPDATES_PER_EPISODE_COLLECTION = 4
-TAU = 0.001
-GUMBEL_TEMPERATURE = 0.8
-EPSILON_START = 1.0
-EPSILON_DECAY = 0.995
-EPSILON_MIN = 0.05
-CLIP_GRAD_NORM = 1.0
 
-# --- Train Config MAPPO ---
-ROLLOUT_LENGTH = 128
+ROLLOUT_LENGTH = 256
 PPO_EPOCHS = 4
-PPO_MINIBATCH_SIZE = 32
+PPO_MINIBATCH_SIZE = 64
 PPO_CLIP_EPS = 0.2
 GAE_LAMBDA = 0.95
-ENTROPY_COEFF = 0.007
+
+# Entropy starts high to encourage exploration, decays toward minimum over training.
+ENTROPY_COEFF = 0.05
+ENTROPY_COEFF_MIN = 0.005
+ENTROPY_COEFF_DECAY = 0.9995
+
 VALUE_LOSS_COEFF = 0.5
 MAX_GRAD_NORM = 0.5
